@@ -31,7 +31,7 @@ from tvm import relay
 from tvm.relay.backend.contrib.ethosu import legalize, preprocess
 from tvm.relay import dataflow_pattern
 from tvm.relay.op.contrib import ethosu
-from tvm.relay.backend.contrib.ethosu import util
+from tvm.relay.backend.contrib.ethosu import util, codegen
 from tvm.relay.build_module import bind_params_by_name
 from tvm.relay.frontend.tflite import get_pad_value
 from tvm.relay.expr_functor import ExprVisitor
@@ -43,6 +43,8 @@ def partition_ethosu_by_table(mod, pattern_table):
     """In case only the legalization part is supported for an operator, we don't
     want to add the operator's pattern to the pattern table so that the compiler
     wouldn't attempt to offload an operator without full stack support."""
+    mod = relay.transform.InferType()(mod)
+    mod = mod = codegen.replicate_pads(mod)
     mod = relay.transform.InferType()(mod)
     mod = relay.transform.MergeComposite(pattern_table)(mod)
     mod = relay.transform.AnnotateTarget("ethos-u")(mod)
@@ -3526,9 +3528,10 @@ def test_tflite_hard_swish(ifm_shape):
     assert tuple(func_body.args[1].checked_type.shape) == (256,)
 
 
-@pytest.mark.parametrize("ifm_shape", [(1, 12), (1, 12, 32)])
-def test_tflite_softmax(ifm_shape):
+def test_tflite_softmax():
+    np.random.seed(0)
     dtype = "int8"
+    ifm_shape = (1, 12)
 
     def create_tflite_graph():
         @tf.function
@@ -3539,7 +3542,7 @@ def test_tflite_softmax(ifm_shape):
         # Convert the model
         def representative_dataset():
             for _ in range(100):
-                data = np.random.rand(*tuple(ifm_shape))
+                data = np.random.uniform(low=-1, high=2, size=tuple(ifm_shape))
                 yield [data.astype(np.float32)]
 
         converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
@@ -3554,43 +3557,53 @@ def test_tflite_softmax(ifm_shape):
     def verify(ext_func):
         out_op = ext_func.body
         ops = []
-        # List of expected operations and their type if it exists
-        expected_ops = [
-            ("reshape", None),
-            ("reshape", None),
-            ("contrib.ethosu.pooling", "MAX"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "SHR"),
-            ("contrib.ethosu.pooling", "SUM"),
-            ("contrib.ethosu.unary_elementwise", "CLZ"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "SHL"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "SHL"),
-            ("contrib.ethosu.binary_elementwise", "ADD"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "ADD"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "ADD"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "ADD"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "ADD"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "MUL"),
-            ("contrib.ethosu.binary_elementwise", "SUB"),
-            ("contrib.ethosu.binary_elementwise", "SHR"),
-            ("reshape", None),
+        # List of expected operations, their type and activation parameters if it exists
+        expected_ops_params = [
+            ("reshape", None, [None, None, None, None, None, None]),
+            ("reshape", None, [None, None, None, None, None, None]),
+            ("contrib.ethosu.pooling", "MAX", [0.011756093241274357, -43, None, None, 0.0, -43]),
+            (
+                "contrib.ethosu.binary_elementwise",
+                "SUB",
+                [0.011756093241274357, -43, 0.0, -43, 1.0, 127],
+            ),
+            ("contrib.ethosu.binary_elementwise", "SHR", [1.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.pooling", "SUM", [0.0, 0, None, None, 0.0, -43]),
+            ("contrib.ethosu.unary_elementwise", "CLZ", [0.0, 0, None, None, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [0.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "SHL", [0.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [0.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "SHL", [0.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "ADD", [0.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "ADD", [2.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [2.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [2.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "ADD", [1.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [2.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [2.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "ADD", [1.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [2.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [2.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "ADD", [1.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 0.0, 0, 1.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "MUL", [1.0, 0, 1.0, 0, 2.0, 0]),
+            ("contrib.ethosu.binary_elementwise", "SUB", [0.0, 0, 0.0, 0, 0.0, -43]),
+            ("contrib.ethosu.binary_elementwise", "SHR", [2.0, 0, 0.0, 0, 0.00390625, -128]),
+            ("reshape", None, [None, None, None, None, None, None]),
         ]
+
+        def get_attr_value(op, attr_name):
+            if hasattr(op.attrs, attr_name):
+                return op.attrs[attr_name]
+            else:
+                return None
 
         def get_op_type(op):
             if hasattr(op.attrs, "pooling_type"):
@@ -3598,6 +3611,16 @@ def test_tflite_softmax(ifm_shape):
             elif hasattr(op.attrs, "operator_type"):
                 return op.attrs.operator_type
             return None
+
+        def get_activation_params(op):
+            activation_params = []
+            activation_params.append(get_attr_value(op, "ifm_scale"))
+            activation_params.append(get_attr_value(op, "ifm_zero_point"))
+            activation_params.append(get_attr_value(op, "ifm2_scale"))
+            activation_params.append(get_attr_value(op, "ifm2_zero_point"))
+            activation_params.append(get_attr_value(op, "ofm_scale"))
+            activation_params.append(get_attr_value(op, "ofm_zero_point"))
+            return activation_params
 
         def _visit(stmt):
             if isinstance(stmt, relay.expr.Call):
@@ -3616,9 +3639,18 @@ def test_tflite_softmax(ifm_shape):
         assert ofm.dtype == dtype
 
         # check operations
-
-        ops = [(op.op.name, get_op_type(op)) for op in ops]
-        assert expected_ops == ops
+        for op, expected_op_params in zip(ops, expected_ops_params):
+            activation_params = get_activation_params(op)
+            expected_op_name, expected_op_type, expected_activation_params = expected_op_params
+            assert op.op.name == expected_op_name
+            assert expected_op_type == get_op_type(op)
+            for activation_param, expected_activation_param in zip(
+                activation_params, expected_activation_params
+            ):
+                if isinstance(activation_param, float):
+                    assert math.isclose(expected_activation_param, activation_param, abs_tol=1e-7)
+                else:
+                    assert expected_activation_param == activation_param
 
     softmax_pattern_table = [
         (
@@ -3642,6 +3674,251 @@ def test_tflite_softmax(ifm_shape):
         legalize.SoftmaxRewriter(), mod["tvmgen_default_ethos_u_main_0"]
     )
     mod = relay.transform.InferType()(mod)
+
+    verify(mod["tvmgen_default_ethos_u_main_0"])
+
+
+@pytest.mark.parametrize("ifm_shape", [(1, 55, 55, 3)])
+@pytest.mark.parametrize("kernel_shape", [(3, 3)])
+@pytest.mark.parametrize("strides, dilation", [((1, 1), (1, 1))])
+@pytest.mark.parametrize("op_padding", ["SAME", "VALID"])
+@pytest.mark.parametrize("sep_padding", [(0, 0, 1, 1), (7, 5, 4, 5)])
+@pytest.mark.parametrize(
+    "op_pairs", [("conv2d", "conv2d"), ("depthwise", "depthwise"), ("conv2d", "depthwise")]
+)
+def test_tflite_shared_pad_legalize(
+    ifm_shape,
+    kernel_shape,
+    strides,
+    dilation,
+    op_padding,
+    sep_padding,
+    op_pairs,
+):
+    dtype = "int8"
+
+    def create_tflite_graph():
+        class Model(tf.Module):
+            @tf.function
+            def tf_function(self, x):
+                def make_depthwise_or_conv2d(pair_idx):
+                    if op_pairs[pair_idx] == "depthwise":
+                        weight_shape = [kernel_shape[0], kernel_shape[1], ifm_shape[3], 1]
+                        weight = tf.constant(np.random.uniform(size=weight_shape), dtype=tf.float32)
+                        return tf.nn.depthwise_conv2d(
+                            x, weight, strides=tf_strides, padding=op_padding, dilations=dilation
+                        )
+                    weight_shape = [kernel_shape[0], kernel_shape[1], ifm_shape[3], 3]
+                    weight = tf.constant(np.random.uniform(size=weight_shape), dtype=tf.float32)
+                    return tf.nn.conv2d(
+                        x,
+                        weight,
+                        strides=tf_strides,
+                        padding=op_padding,
+                        dilations=dilation,
+                    )
+
+                x = tf.pad(
+                    x,
+                    [
+                        [0, 0],
+                        [sep_padding[0], sep_padding[2]],
+                        [sep_padding[1], sep_padding[3]],
+                        [0, 0],
+                    ],
+                    "CONSTANT",
+                )
+
+                # The input strides to the TensorFlow API needs to be of shape 1x4
+                tf_strides = [1, strides[0], strides[1], 1]
+
+                x1 = make_depthwise_or_conv2d(0)
+                x2 = make_depthwise_or_conv2d(1)
+
+                x3 = tf.math.add(x1, x2)
+                return x3
+
+        model = Model()
+        concrete_func = model.tf_function.get_concrete_function(
+            tf.TensorSpec(ifm_shape, dtype=tf.float32)
+        )
+        # Convert the model
+        def representative_dataset():
+            for _ in range(100):
+                data = np.random.rand(*tuple(ifm_shape))
+                yield [data.astype(np.float32)]
+
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = representative_dataset
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+        tflite_model = converter.convert()
+        return tflite_model
+
+    conv2d_pattern_table = [
+        (
+            ethosu.QnnConv2DParams.composite_name,
+            ethosu.qnn_conv2d_pattern(),
+            lambda pat: ethosu.QnnConv2DParams(pat).is_valid(),
+        ),
+        (
+            ethosu.QnnDepthwiseConv2DParams.composite_name,
+            ethosu.qnn_depthwise_conv2d_pattern(),
+            lambda pat: ethosu.QnnDepthwiseConv2DParams(pat).is_valid(),
+        ),
+    ]
+
+    tflite_graph = create_tflite_graph()
+    tflite_model = tflite.Model.Model.GetRootAsModel(tflite_graph, 0)
+
+    mod, params = relay.frontend.from_tflite(
+        tflite_model,
+        shape_dict={"input": ifm_shape},
+        dtype_dict={"input": dtype},
+    )
+
+    mod["main"] = bind_params_by_name(mod["main"], params)
+    mod = partition_ethosu_by_table(mod, conv2d_pattern_table)
+
+    mod["tvmgen_default_ethos_u_main_0"] = dataflow_pattern.rewrite(
+        [legalize.Conv2DRewriter(), legalize.DepthwiseConv2DRewriter()],
+        mod["tvmgen_default_ethos_u_main_0"],
+    )
+    mod["tvmgen_default_ethos_u_main_1"] = dataflow_pattern.rewrite(
+        [legalize.Conv2DRewriter(), legalize.DepthwiseConv2DRewriter()],
+        mod["tvmgen_default_ethos_u_main_1"],
+    )
+
+    if op_pairs[0] == "depthwise":
+        assert (
+            mod["tvmgen_default_ethos_u_main_0"].body.op.name == "contrib.ethosu.depthwise_conv2d"
+        )
+    else:
+        assert mod["tvmgen_default_ethos_u_main_0"].body.op.name == "contrib.ethosu.conv2d"
+
+    if op_pairs[1] == "depthwise":
+        assert (
+            mod["tvmgen_default_ethos_u_main_1"].body.op.name == "contrib.ethosu.depthwise_conv2d"
+        )
+    else:
+        assert mod["tvmgen_default_ethos_u_main_1"].body.op.name == "contrib.ethosu.conv2d"
+
+
+def test_tflite_matmul():
+    ifm_shape = [1, 4]
+    ifm2_shape = [2, 4]
+    ifm_shapes = [ifm_shape, ifm2_shape]
+    ofm_shape = [ifm_shape[0], ifm2_shape[0]]
+    dtype = "int8"
+
+    def create_tflite_graph():
+        class Model(tf.Module):
+            @tf.function
+            def matmul(self, x, y):
+                res = tf.matmul(x, y, transpose_b=True)
+                return res
+
+        model = Model()
+        concrete_func = model.matmul.get_concrete_function(
+            *[tf.TensorSpec(shape, tf.float32) for shape in ifm_shapes]
+        )
+        # Convert the model
+        def representative_dataset():
+            for _ in range(100):
+                datas = [np.random.rand(*shape) for shape in ifm_shapes]
+                yield [data.astype(np.float32) for data in datas]
+
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = representative_dataset
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+        tflite_model = converter.convert()
+        return tflite_model
+
+    def verify(ext_func):
+        ofm = ext_func.body
+        ops = []
+
+        def _visit(stmt):
+            if isinstance(stmt, relay.expr.Call):
+                ops.append(stmt)
+
+        relay.analysis.post_order_visit(ofm, _visit)
+        ofm_checked_type = ofm.checked_type
+        ofm_channels = ofm_shape[-1]
+
+        # check IFM
+        ifm = ops[1].checked_type
+        assert list(ifm.shape) == ifm_shape
+        assert str(ifm.dtype) == dtype
+
+        # check IFM2
+        ifm2 = ops[3].checked_type
+        assert list(ifm2.shape) == ifm2_shape
+        assert str(ifm2.dtype) == dtype
+
+        # check split
+        split = ops[4]
+        split_checked_types = list(split.checked_type.fields)
+        assert split.op.name == "split"
+        assert split.attrs.axis == 0
+        assert int(split.attrs.indices_or_sections) == ofm_channels
+        for split_checked_type in split_checked_types:
+            assert list(split_checked_type.shape) == ifm_shape
+            assert str(split_checked_type.dtype) == dtype
+
+        # check MUL
+        mul_ops = [ops[6], ops[10]]
+        for mul_op in mul_ops:
+            assert mul_op.op.name == "contrib.ethosu.binary_elementwise"
+            assert mul_op.attrs.operator_type == "MUL"
+            assert mul_op.attrs.ofm_dtype == "int32"
+
+        # check reduce sum
+        reduce_sum_ops = [ops[7], ops[11]]
+        for reduce_sum_op in reduce_sum_ops:
+            assert reduce_sum_op.op.name == "contrib.ethosu.pooling"
+            assert reduce_sum_op.attrs.pooling_type == "SUM"
+            assert list(reduce_sum_op.checked_type.shape) == [1, 1, 1, 1]
+
+        # check concatenation
+        concatenation = ofm.args[0]
+        concatenation_shape = concatenation.checked_type.shape
+        assert concatenation.op.name == "concatenate"
+        assert list(concatenation_shape) == [1, 1, 1, ofm_channels]
+
+        # check OFM
+        assert ofm.op.name == "reshape"
+        assert list(ofm_checked_type.shape) == ofm_shape
+        assert str(ofm_checked_type.dtype) == dtype
+
+    matmul_pattern_table = [
+        (
+            ethosu.MatMulParams.composite_name,
+            ethosu.matmul_pattern(),
+            lambda pat: ethosu.MatMulParams(pat).is_valid(),
+        )
+    ]
+
+    tflite_graph = create_tflite_graph()
+    tflite_model = tflite.Model.Model.GetRootAsModel(tflite_graph, 0)
+
+    mod, params = relay.frontend.from_tflite(
+        tflite_model,
+        shape_dict={("ifm" + str(i)): shape for i, shape in enumerate(ifm_shapes)},
+        dtype_dict={("ifm" + str(i)): dtype for i, _ in enumerate(ifm_shapes)},
+    )
+
+    mod["main"] = bind_params_by_name(mod["main"], params)
+    mod = partition_ethosu_by_table(mod, matmul_pattern_table)
+
+    mod["tvmgen_default_ethos_u_main_0"] = dataflow_pattern.rewrite(
+        legalize.MatMulRewriter(), mod["tvmgen_default_ethos_u_main_0"]
+    )
 
     verify(mod["tvmgen_default_ethos_u_main_0"])
 

@@ -1900,6 +1900,44 @@ def qnn_fc_pattern():
     return optional_clip
 
 
+class MatMulParams(FullyConnectedParams):
+    """
+    This class will parse a call to an ethos-u.matmul composite
+    function and extract the parameter information.
+    """
+
+    composite_name = "ethos-u.matmul"
+
+    @requires_vela
+    def __init__(self, func_body):
+        FullyConnectedParams.__init__(self, func_body)
+
+    def is_valid(self) -> bool:
+        """
+        Checks whether matrix multiplication has compatible attributes with HW
+        """
+
+        if not check_valid_dtypes([self.ifm, self.ofm], supported_dtypes=[np.int8]):
+            return False
+        if not len(self.ifm.shape) == 2:
+            return False
+        if not len(self.ofm.shape) == 2:
+            return False
+        # The weights must be transposed
+        if self.ifm.shape[1] != self.weights.shape[1]:
+            return False
+        return True
+
+
+def matmul_pattern():
+    dense = is_op("qnn.dense")(
+        wildcard(), wildcard(), is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    req = is_op("qnn.requantize")(dense, is_constant(), is_constant(), is_constant(), is_constant())
+    optional_clip = req.optional(is_op("clip"))
+    return optional_clip
+
+
 class HardSwishParams:
     """
     This class will parse a call to a ethos-u.hard_swish composite function
@@ -2186,6 +2224,11 @@ def pattern_table() -> List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Cal
             lambda pat: FullyConnectedParams(pat).is_valid(),
         ),
         (
+            MatMulParams.composite_name,
+            matmul_pattern(),
+            lambda pat: MatMulParams(pat).is_valid(),
+        ),
+        (
             MaxPool2DParams.composite_name,
             qnn_maxpool2d_pattern(),
             lambda pat: MaxPool2DParams(pat).is_valid(),
@@ -2341,12 +2384,14 @@ def partition_for_ethosu(
     mod : IRModule
         The partitioned IRModule with external global functions
     """
-    from tvm.relay.backend.contrib.ethosu import preprocess
+    from tvm.relay.backend.contrib.ethosu import preprocess, codegen
 
     if params:
         mod["main"] = bind_params_by_name(mod["main"], params)
 
     pattern = relay.op.contrib.get_pattern_table("ethos-u")
+    mod = relay.transform.InferType()(mod)
+    mod = codegen.replicate_pads(mod)
     mod = relay.transform.InferType()(mod)
     mod = relay.transform.MergeComposite(pattern)(mod)
     mod = relay.transform.AnnotateTarget("ethos-u")(mod)

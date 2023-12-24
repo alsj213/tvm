@@ -230,6 +230,20 @@ def StorageRewrite():
     return _ffi_api.StorageRewrite()  # type: ignore
 
 
+def PointerValueTypeRewrite():
+    """
+    Rewrite the pointer content type of arguments, as well as Alloc internal to the function to use
+    the most frequently accessed type for load/store to avoid pointer casting in backend when
+    possible.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.PointerValueTypeRewrite()  # type: ignore
+
+
 def UnrollLoop():
     """Unroll the constant loop marked by unroll.
 
@@ -831,6 +845,17 @@ def ConvertBlocksToOpaque():
     return _ffi_api.ConvertBlocksToOpaque()  # type: ignore
 
 
+def LiftThreadBinding():
+    """Lift the same thread bindings to their LCA loops.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LiftThreadBinding()  # type: ignore
+
+
 def CompactBufferAllocation(is_strict: bool = True):
     """Compact the buffer access region. by removing the buffer regions
     that are not accessed, i.e. narrowing the buffer shape and adjust
@@ -914,6 +939,28 @@ def FlattenBuffer():
         The result pass
     """
     return _ffi_api.FlattenBuffer()  # type: ignore
+
+
+def TransformMmaBufferLayout():
+    """Transform mma buffer layout
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.TransformMmaBufferLayout()  # type: ignore
+
+
+def InjectPermutedLayout():
+    """Inject permuted layout in mma
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectPermutedLayout()  # type: ignore
 
 
 def UnifyThreadBinding():

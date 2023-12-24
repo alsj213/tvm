@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """The TensorIR schedule class"""
+import inspect
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from tvm._ffi import register_object as _register_object
@@ -91,6 +92,15 @@ def _parse_seed(seed: Optional[int]) -> int:
     if seed < 1 or seed > 2147483647:
         raise ValueError(f"seed must be in the range [1, 2147483647], but gets: {seed}")
     return seed
+
+
+def _get_block_default_dtype(block: Block) -> str:
+    for i in block.iter_vars:
+        return i.var.dtype
+    for buffer_region in list(block.reads) + list(block.writes):
+        for dom in buffer_region.region:
+            return dom.min.dtype
+    return "int64"
 
 
 @_register_object("tir.Schedule")
@@ -259,26 +269,24 @@ class Schedule(Object):
         """
         return _ffi_api.ScheduleForkSeed(self)  # type: ignore # pylint: disable=no-member
 
-    def show(self, style: Optional[str] = None, black_format: bool = True) -> None:
+    def show(self, *args, **kwargs) -> None:
         """A sugar for print highlighted TVM script.
 
-        Parameters
-        ----------
-        style : str, optional
-
-            Pygmentize printing style, auto-detected if None.  See
-            `tvm.script.highlight.cprint` for more details.
-
-        black_format: bool
-
-            If true (default), use the formatter Black to format the TVMScript
+        All parameters are forwarded to the underlying `Module.show`
+        and `Trace.show` methods.
         """
         mod = self.mod
         if mod is not None:
-            mod.show(style=style, black_format=black_format)
+            mod.show(*args, **kwargs)
+
         trace = self.trace
         if trace is not None:
-            trace.show(style=style, black_format=black_format)
+            # Trace.show only supports the style and black_format arguments
+            param_binding = inspect.signature(mod.show).bind(*args, **kwargs)
+            param_binding.apply_defaults()
+            bound_args = param_binding.arguments
+
+            trace.show(style=bound_args["style"], black_format=bound_args["black_format"])
 
     ########## Lookup ##########
 
@@ -399,6 +407,46 @@ class Schedule(Object):
         return list(
             _ffi_api.ScheduleSamplePerfectTile(  # type: ignore  # pylint: disable=no-member
                 self, loop, n, max_innermost_factor, decision
+            )
+        )
+
+    @type_checked
+    def sample_partitioned_tile(
+        self,
+        loop: LoopRV,
+        n: int,
+        partition_pos: int = 0,
+        innerpart_factor: int = 1,
+        decision: Optional[List[int]] = None,
+    ) -> List[ExprRV]:
+        """Sample the factors to a partitioned tile for a specific loop
+
+        Parameters
+        ----------
+        loop : LoopRV
+            The loop to be tiled
+        n : int
+            The number of tiles to be sampled
+        partition_pos : int
+            The position to partition tiles to two parts
+        innerpart_factor : int
+            The factor of the second part
+        decision: Optional[List[int]]
+            The sampling decision, if any
+
+        Returns
+        -------
+        result : List[ExprRV]
+            A list of length `n`, the random partitioned tile sizes sampled
+        """
+        return list(
+            _ffi_api.ScheduleSamplePartitionedTile(  # type: ignore  # pylint: disable=no-member
+                self,
+                loop,
+                n,
+                partition_pos,
+                innerpart_factor,
+                decision,
             )
         )
 
@@ -1452,7 +1500,10 @@ class Schedule(Object):
         block = self._normalize_block_arg(block)
 
         if callable(index_map):
-            index_map = IndexMap.from_func(index_map)
+            index_map = IndexMap.from_func(
+                index_map,
+                index_dtype=_get_block_default_dtype(self.get(block)),
+            )
         return _ffi_api.ScheduleReindexCacheRead(  # type: ignore # pylint: disable=no-member
             self, block, read_buffer_index, storage_scope, index_map
         )
@@ -1549,7 +1600,10 @@ class Schedule(Object):
         block = self._normalize_block_arg(block)
 
         if callable(index_map):
-            index_map = IndexMap.from_func(index_map)
+            index_map = IndexMap.from_func(
+                index_map,
+                index_dtype=_get_block_default_dtype(self.get(block)),
+            )
         return _ffi_api.ScheduleReindexCacheWrite(  # type: ignore # pylint: disable=no-member
             self, block, write_buffer_index, storage_scope, index_map
         )
@@ -1562,7 +1616,7 @@ class Schedule(Object):
         storage_scope: str,
     ) -> List[BlockRV]:
         """Create blocks that reads & write a buffer region into a cache block.
-        It requires the the target block both read & write the target buffer.
+        It requires the target block both read & write the target buffer.
         Mainly for inplace operation.
 
         Parameters
@@ -3206,14 +3260,22 @@ class Schedule(Object):
 
         ndim = len(buffer_obj.shape)
         if callable(index_map):
-            index_map, axis_separators = IndexMap.from_func_with_separators(index_map, ndim=ndim)
+            index_map, axis_separators = IndexMap.from_func_with_separators(
+                index_map,
+                ndim=ndim,
+                index_dtype=_get_block_default_dtype(self.get(block)),
+            )
         else:
             axis_separators = []
 
         if pad_value is None:
             pass
         elif callable(pad_value):
-            pad_value = IndexMap.from_func(pad_value, ndim=len(index_map.final_indices))
+            pad_value = IndexMap.from_func(
+                pad_value,
+                ndim=len(index_map.final_indices),
+                index_dtype=_get_block_default_dtype(self.get(block)),
+            )
         elif not isinstance(pad_value, IndexMap):
             # Explicitly convert python int/float arguments to the
             # buffer's type.  If the default `tvm.runtime.convert`
@@ -3224,7 +3286,9 @@ class Schedule(Object):
             elif "float" in buffer_obj.dtype and isinstance(pad_value, float):
                 pad_value = FloatImm(buffer_obj.dtype, pad_value)
             pad_value = IndexMap.from_func(
-                lambda *indices: pad_value, ndim=len(index_map.final_indices)
+                lambda *indices: pad_value,
+                ndim=len(index_map.final_indices),
+                index_dtype=_get_block_default_dtype(self.get(block)),
             )
 
         buffer_index_type_enum = 0 if buffer_index_type == "read" else 1
@@ -3297,7 +3361,10 @@ class Schedule(Object):
         """
         block = self._normalize_block_arg(block)
         if callable(index_map):
-            index_map = IndexMap.from_func(index_map)
+            index_map = IndexMap.from_func(
+                index_map,
+                index_dtype=_get_block_default_dtype(self.get(block)),
+            )
         _ffi_api.ScheduleTransformBlockLayout(  # type: ignore # pylint: disable=no-member
             self, block, index_map
         )
@@ -3483,19 +3550,13 @@ class Schedule(Object):
     def pad_einsum(self, block: Union[BlockRV, str], padding: List[int]) -> None:
         """Pad the computation of Einsum.
 
-        This schedule primitives identifies the Einsum pattern in the block body, and find its
-        producer blocks. It then pads the computation of the Einsum pattern and its producer blocks.
-        The output buffer and the producer buffer is resized according to the padding size. It
-        requires the output buffer and the producer buffer to be allocated inside the PrimFunc.
+        On a block with trivial binding, this primitive pads the iteration domain of the block by
+        the given padding factors, for example, 127 -> 128, 132 -> 144 when padding factor is 16.
+        Extra producer and consumer padding blocks will be generated to avoid out-of-bound buffer
+        access.
 
-        The padding is a list of non-negative integers, each element corresponds to the padding for
-        each block iter in the order of block iters. The block and it's producer blocks should have
-        trivial bindings, i.e. each block iter is bound to a single loop variable. After padding,
-        thblock iter extent and the corresponding outer loop is extended by the padding size.
-
-        The size of the producer buffers are infered from the padding size of the Einsum
-        computation. The producer buffers are padded by the initial value of the corresponding
-        reduction.
+        Einsum pattern means all the indices on the buffer access are either by constants
+        (e.g. B[0]) or by variables (e.g. B[i]), but not by composite expressions (e.g. B[i + 1]).
 
         Parameters
         ----------
@@ -3514,31 +3575,16 @@ class Schedule(Object):
 
             @T.prim_func
             def before_pad_einsum(
-                A: T.Buffer((128, 127), "float32"),
+                A: T.Buffer((127, 127), "float32"),
                 B: T.Buffer((127, 127), "float32"),
-                C: T.Buffer((128, 127), "float32"),
+                C: T.Buffer((127, 127), "float32"),
             ) -> None:
-                A_shared = T.alloc_buffer((128, 127), "float32", scope="shared")
-                B_shared = T.alloc_buffer((127, 127), "float32", scope="shared")
-                C_shared = T.alloc_buffer((128, 127), "float32", scope="shared")
-                for i0, i1 in T.grid(128, 127):
-                    with T.block("A"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        A_shared[i, j] = A[i, j]
-                for i0, i1 in T.grid(127, 127):
-                    with T.block("B"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        B_shared[i, j] = B[i, j]
-                for i0, i1, i2 in T.grid(128, 127, 127):
+                for i0, i1, i2 in T.grid(127, 127, 127):
                     with T.block("C_shared"):
                         i, j, k = T.axis.remap("SSR", [i0, i1, i2])
                         with T.init():
-                            C_shared[i, j] = T.float32(0)
-                        C_shared[i, j] = C_shared[i, j] + A_shared[i, k] * B_shared[k, j]
-                for i0, i1 in T.grid(128, 127):
-                    with T.block("C"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        C[i, j] = C_shared[i, j]
+                            C[i, j] = T.float32(0)
+                        C[i, j] = C[i, j] + A[i, k] * B[k, j]
 
         Create the schedule and do pad-einsum with specified block:
 
@@ -3546,7 +3592,7 @@ class Schedule(Object):
 
             sch = tir.Schedule(before_pad_einsum, debug_mask="all")
             block = sch.get_block("C_shared")
-            sch.pad_einsum(block, [0, 1, 1])
+            sch.pad_einsum(block, [32, 32, 32])
             print(sch.mod["main"].script())
 
         After applying decompose-padding, the IR becomes:
@@ -3554,46 +3600,41 @@ class Schedule(Object):
         .. code-block:: python
 
             @T.prim_func
-            def after_pad_einsum(
-                A: T.Buffer((128, 127), "float32"),
+            def main(
+                A: T.Buffer((127, 127), "float32"),
                 B: T.Buffer((127, 127), "float32"),
-                C: T.Buffer((128, 127), "float32"),
-            ) -> None:
-                A_shared_padded = T.alloc_buffer([128, 128], dtype="float32", scope="shared")
-                B_shared_padded = T.alloc_buffer([128, 128], dtype="float32", scope="shared")
-                C_shared_padded = T.alloc_buffer([128, 128], dtype="float32", scope="shared")
+                C: T.Buffer((127, 127), "float32"),
+            ):
+                # with T.block("root"):
+                A_pad = T.alloc_buffer((128, 128))
+                B_pad = T.alloc_buffer((128, 128))
+                C_pad = T.alloc_buffer((128, 128))
                 for i0, i1 in T.grid(128, 128):
-                    with T.block("A"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        T.reads(A[i, j])
-                        T.writes(A_shared_padded[i, j])
-                        A_shared_padded[i, j] = T.if_then_else(
-                            j < 127, A[i, j], T.float32(0), dtype="float32"
+                    with T.block("A_pad"):
+                        v0, v1 = T.axis.remap("SS", [i0, i1])
+                        A_pad[v0, v1] = T.if_then_else(
+                            v0 < 127 and v1 < 127,
+                            A[v0, v1],
+                            T.float32(0),
                         )
                 for i0, i1 in T.grid(128, 128):
-                    with T.block("B"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        T.reads(B[i, j])
-                        T.writes(B_shared_padded[i, j])
-                        B_shared_padded[i, j] = T.if_then_else(
-                            i < 127 and j < 127, B[i, j], T.float32(0), dtype="float32"
+                    with T.block("B_pad"):
+                        v0, v1 = T.axis.remap("SS", [i0, i1])
+                        B_pad[v0, v1] = T.if_then_else(
+                            v0 < 127 and v1 < 127,
+                            B[v0, v1],
+                            T.float32(0),
                         )
                 for i0, i1, i2 in T.grid(128, 128, 128):
                     with T.block("C_shared"):
                         i, j, k = T.axis.remap("SSR", [i0, i1, i2])
-                        T.reads(A_shared_padded[i, k], B_shared_padded[k, j])
-                        T.writes(C_shared_padded[i, j])
                         with T.init():
-                            C_shared_padded[i, j] = T.float32(0)
-                        C_shared_padded[i, j] = (
-                            C_shared_padded[i, j] + A_shared_padded[i, k] * B_shared_padded[k, j]
-                        )
-                for i0, i1 in T.grid(128, 127):
-                    with T.block("C"):
-                        i, j = T.axis.remap("SS", [i0, i1])
-                        T.reads(C_shared_padded[i, j])
-                        T.writes(C[i, j])
-                        C[i, j] = C_shared_padded[i, j]
+                            C_pad[i, j] = T.float32(0)
+                        C_pad[i, j] = C_pad[i, j] + A_pad[i, k] * B_pad[k, j]
+                for i0, i1 in T.grid(127, 127):
+                    with T.block("C_pad"):
+                        v0, v1 = T.axis.remap("SS", [i0, i1])
+                        C[v0, v1] = C_pad[v0, v1]
 
         """
         block = self._normalize_block_arg(block)
@@ -3712,3 +3753,34 @@ class Schedule(Object):
     def enter_postproc(self) -> None:
         """A no-op that marks the start of postprocessing phase of scheduling"""
         _ffi_api.ScheduleEnterPostproc(self)  # type: ignore # pylint: disable=no-member
+
+    @type_checked
+    def unsafe_hide_buffer_access(
+        self, block: BlockRV, buf_type: str, buf_index_array: List[int]
+    ) -> None:
+        """Hide some buffer access in a given block. This is an unsafe schedule primitive.
+
+        Parameters
+        ----------
+        block : BlockRV
+            The block where we hide read access.
+        buf_type : str
+            The buffer type: "read"/"write".
+        buf_index_array : List[int]
+            The array of buffer indices we hide access.
+
+        Note
+        ----
+        This schedule primitive is unsafe, and may fail dependency analysis.
+        One use case of `unsafe_hide_buffer_access` is to hide the buffer access
+        to indices buffers (e.g. in sparse computation) so that we can further tensorize
+        the block (the indices buffers appeared in read/write regions may fail the pattern
+        matching in `tensorize` primitive, and hide the access to these buffers could address
+        the issue).
+        """
+        _ffi_api.ScheduleUnsafeHideBufferAccess(  # type: ignore # pylint: disable=no-member
+            self,
+            block,
+            buf_type,
+            buf_index_array,
+        )

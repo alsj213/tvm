@@ -68,11 +68,11 @@ class CodeGenNVPTX : public CodeGenLLVM {
  public:
   llvm::Function* DeclareFunction(const GlobalVar& gvar, const PrimFunc& f) final {
     // add function as void return value
-    return CodeGenLLVM::DeclareFunctionInternal(gvar, f, true);
+    return CodeGenLLVM::DeclareFunctionInternal(gvar, f);
   }
   void AddFunction(const GlobalVar& gvar, const PrimFunc& f) final {
     // add function as void return value
-    CodeGenLLVM::AddFunctionInternal(gvar, f, true);
+    CodeGenLLVM::AddFunctionInternal(gvar, f);
     // annotate as kernel function
     llvm::LLVMContext* ctx = llvm_target_->GetContext();
     module_->getOrInsertNamedMetadata("nvvm.annotations")
@@ -345,9 +345,12 @@ runtime::Module BuildNVPTX(IRModule mod, Target target) {
   ICHECK(tm->addPassesToEmitFile(pass, dest_ptx, nullptr, llvm::TargetMachine::CGFT_AssemblyFile) ==
          0)
       << "Cannot emit target CGFT_ObjectFile";
-#else
+#elif TVM_LLVM_VERSION <= 170
   ICHECK(tm->addPassesToEmitFile(pass, dest_ptx, nullptr, llvm::CGFT_AssemblyFile) == 0)
       << "Cannot emit target CGFT_ObjectFile";
+#else
+  ICHECK(tm->addPassesToEmitFile(pass, dest_ptx, nullptr, llvm::CodeGenFileType::AssemblyFile) == 0)
+      << "Cannot emit target CodeGenFileType::ObjectFile";
 #endif
   pass.run(*module);
   std::string ptx(data_ptx.begin(), data_ptx.end());

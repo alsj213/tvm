@@ -55,8 +55,14 @@ void MetalWorkspace::GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) {
         break;
       }
       case kWarpSize: {
-        // Set warp size to be 1 for safty reason.
+#if defined(__x86_64__)
         *rv = 1;
+#elif defined(__aarch64__)
+        *rv = 32;
+#else
+        LOG(WARNING) << "The CPU architecture is neither x86 nor aarch64. Fallback to warp size 1.";
+        *rv = 1;
+#endif
         break;
       }
       case kMaxSharedMemoryPerBlock:
@@ -80,6 +86,8 @@ void MetalWorkspace::GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) {
       case kApiVersion:
         return;
       case kDriverVersion:
+        return;
+      case kL2CacheSizeBytes:
         return;
     }
   };
@@ -162,7 +170,7 @@ void MetalWorkspace::Init() {
   for (size_t i = 0; i < devs.count; ++i) {
     id<MTLDevice> d = [devs objectAtIndex:i];
     devices.push_back(d);
-    LOG(INFO) << "Intializing Metal device " << i << ", name=" << [d.name UTF8String];
+    DLOG(INFO) << "Intializing Metal device " << i << ", name=" << [d.name UTF8String];
     warp_size.push_back(GetWarpSize(d));
   }
 #endif

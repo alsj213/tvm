@@ -64,18 +64,21 @@ class SubroutineCallRewriter : public StmtExprMutator {
 
     if (auto gvar = node->op.as<GlobalVarNode>()) {
       if (external_methods_.count(gvar)) {
-        Array<PrimExpr> args = node->args.Map([this](const PrimExpr& arg) -> PrimExpr {
+        Array<PrimExpr> args = node->args.Map([](const PrimExpr& arg) -> PrimExpr {
           if (auto* as_call = arg.as<CallNode>()) {
             if (as_call->op.same_as(builtin::tvm_stack_make_array())) {
               PrimExpr data_ptr = as_call->args[0];
-              made_change_ = true;
               return data_ptr;
             }
           }
           return arg;
         });
-        if (!args.same_as(node->args)) {
-          node.CopyOnWrite()->args = args;
+
+        if (!args.same_as(node->args) || node->dtype != DataType::Int(32)) {
+          auto write_ptr = node.CopyOnWrite();
+          write_ptr->dtype = DataType::Int(32);
+          write_ptr->args = args;
+          made_change_ = true;
         }
       }
     }
@@ -147,7 +150,9 @@ PrimFunc MakeUnpackedAPI(PrimFunc func) {
     device_init.push_back(AttrStmt(node, attr::device_type, device_type, nop));
   }
 
-  func_ptr->body = MergeNest(device_init, func_ptr->body);
+  Stmt body = MergeNest(device_init, SeqStmt({func_ptr->body, Evaluate(ret(Integer(0)))}));
+
+  func_ptr->body = body;
   func_ptr->params = args;
   func_ptr->ret_type = PrimType(DataType::Int(32));
   func_ptr->buffer_map = Map<Var, Buffer>();

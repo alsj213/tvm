@@ -120,6 +120,8 @@ def _convert_activation(
     if act_type == "hard_sigmoid":
         x = (_expr.const(0.2, dtype="float32") * inexpr) + _expr.const(0.5, dtype="float32")
         return _op.clip(x, a_min=0.0, a_max=1.0)
+    if act_type == "swish":
+        return inexpr * _op.sigmoid(inexpr)
 
     raise tvm.error.OpNotImplemented(f"Operator {act_type} is not supported in frontend Keras.")
 
@@ -131,11 +133,13 @@ def _convert_advanced_activation(inexpr, keras_layer, etab, data_layout, input_s
 
     if act_type == "Softmax":
         axis = keras_layer.axis
-        dims = len(input_shape)
+        dims = len(input_shape) if input_shape else 0
         if isinstance(axis, list):
             raise tvm.error.OpAttributeUnImplemented(f"Softmax with axes {axis} is not supported.")
         if data_layout == "NCHW":
-            if axis == -1:
+            if dims == 0:
+                axis = 0
+            elif axis == -1:
                 axis = 1
             else:
                 axis = axis + 1 if axis < dims - 1 else 1
@@ -254,6 +258,8 @@ def _convert_dense(
     weightList = keras_layer.get_weights()
     weight = etab.new_const(weightList[0].transpose([1, 0]))
     params = {"weight": weight, "units": weightList[0].shape[1]}
+    units = list(weightList[0].shape)[1]
+    assert units > 0, "The value of units must be a positive integer"
     if input_shape is None:
         input_shape = keras_layer.input_shape
     input_dim = len(input_shape)
@@ -262,7 +268,7 @@ def _convert_dense(
         input_shape = tuple(dim if dim else 1 for dim in _as_list(input_shape)[0])
         if input_dim != 3 or input_shape[0] != 1 or input_shape[1] != 1:
             raise tvm.error.OpAttributeInvalid(
-                f"Input shape {nput_shape} is not valid for operator Dense."
+                f"Input shape {input_shape} is not valid for operator Dense."
             )
         inexpr = _op.squeeze(inexpr, axis=[0])
     out = _op.nn.dense(data=inexpr, **params)
@@ -569,13 +575,17 @@ def _convert_separable_convolution(inexpr, keras_layer, etab, data_layout, input
         weight0 = weightList[0].transpose([2, 3, 0, 1])
     else:
         weight0 = weightList[0]
+    if isinstance(keras_layer.dilation_rate, (list, tuple)):
+        dilation = [keras_layer.dilation_rate[0], keras_layer.dilation_rate[1]]
+    else:
+        dilation = [keras_layer.dilation_rate, keras_layer.dilation_rate]
     params0 = {
         "weight": etab.new_const(weight0),
         "channels": in_channels * depth_mult,
         "groups": in_channels,
         "kernel_size": [kernel_h, kernel_w],
         "strides": [stride_h, stride_w],
-        "dilation": [1, 1],
+        "dilation": dilation,
         "padding": [0, 0],
         "data_layout": data_layout,
         "kernel_layout": kernel_layout,
@@ -767,10 +777,8 @@ def _convert_upsample(
         params["scale_h"] = h
     elif upsample_type == "UpSampling2D":
         h, w = keras_layer.size
-        if h != w:
-            raise tvm.error.OpAttributeInvalid("Height must equal width for operator Upsample.")
         params["scale_h"] = h
-        params["scale_w"] = h
+        params["scale_w"] = w
 
         if hasattr(keras_layer, "interpolation"):
             interpolation = keras_layer.interpolation
@@ -818,10 +826,16 @@ def _convert_cropping(
             f"Operator {crop_type} is not supported for frontend Keras."
         )
     int32_max = np.iinfo(np.int32).max
+    if data_layout == "NHWC":
+        begin = [0, crop_t, crop_l, 0]
+        end = [int32_max, in_h - crop_b, in_w - crop_r, int32_max]
+    else:
+        begin = [0, 0, crop_t, crop_l]
+        end = [int32_max, int32_max, in_h - crop_b, in_w - crop_r]
     return _op.strided_slice(
         inexpr,
-        begin=[0, 0, crop_t, crop_l],
-        end=[int32_max, int32_max, in_h - crop_b, in_w - crop_r],
+        begin=begin,
+        end=end,
     )
 
 
@@ -947,10 +961,13 @@ def _convert_concat(
     if input_shape is None:
         input_shape = keras_layer.input_shape
 
-    if data_layout == "NHWC" or len(input_shape[0]) < 4:
-        axis = -1
-    else:
-        axis = 1
+    axis = keras_layer.axis
+    dims = len(input_shape[0])
+    if data_layout == "NCHW":  # need_transpose
+        if axis == -1:
+            axis = 1
+        else:
+            axis = axis + 1 if axis < (dims - 1) else 1
     return _op.concatenate(_as_list(inexpr), axis=axis)
 
 
@@ -994,7 +1011,10 @@ def _convert_lstm(
     recurrent_weight = etab.new_const(weightList[1].transpose([1, 0]))
     if keras_layer.use_bias:
         in_bias = etab.new_const(weightList[2])
+    if keras_layer.go_backwards:
+        in_data = _op.reverse(in_data, axis=1)
     units = list(weightList[0].shape)[1]
+    assert units > 0, "The value of units must be a positive integer"
     time_steps = in_shape[1]
     in_data = _op.squeeze(in_data, axis=[0])
     in_data = _op.split(in_data, indices_or_sections=time_steps, axis=0)
@@ -1032,22 +1052,28 @@ def _convert_simple_rnn(
         inexpr = [inexpr, prev_op]
     in_data = inexpr[0]
     prev_op = inexpr[1]
+    prev_op = _op.nn.batch_flatten(prev_op)
     weightList = keras_layer.get_weights()
     kernel_weight = etab.new_const(weightList[0].transpose([1, 0]))
     recurrent_weight = etab.new_const(weightList[1].transpose([1, 0]))
+    units = list(weightList[0].shape)[1]
+    assert units > 0, "The value of units must be a positive integer"
     if keras_layer.use_bias:
         in_bias = etab.new_const(weightList[2])
-    units = list(weightList[0].shape)[1]
-    in_data = _op.nn.batch_flatten(in_data)
-    ixh = _op.nn.dense(in_data, kernel_weight, units=units)
-    if keras_layer.use_bias:
-        ixh = _op.nn.bias_add(ixh, bias=in_bias)
-    prev_op = _op.nn.batch_flatten(prev_op)
-    ixh2 = _op.nn.dense(prev_op, recurrent_weight, units=units)
-    output = ixh + ixh2
-    output = _convert_activation(output, keras_layer, etab, data_layout)
-    out_shape = tuple(dim if dim else 1 for dim in _as_list(keras_layer.output_shape)[0])
-    output = _op.reshape(output, newshape=out_shape)
+    assert len(in_data.type_annotation.shape) == 3
+    timeDim = in_data.type_annotation.shape[1].value
+    if keras_layer.go_backwards:
+        in_data = _op.reverse(in_data, axis=1)
+    in_data_split = _op.split(in_data, indices_or_sections=timeDim, axis=1)
+    for i in range(len(in_data_split)):
+        in_data_split_i = _op.nn.batch_flatten(in_data_split[i])
+        ixh = _op.nn.dense(in_data_split_i, kernel_weight, units=units)
+        if keras_layer.use_bias:
+            ixh = _op.nn.bias_add(ixh, bias=in_bias)
+        ixh2 = _op.nn.dense(prev_op, recurrent_weight, units=units)
+        output = ixh + ixh2
+        output = _convert_activation(output, keras_layer, etab, data_layout)
+        prev_op = output
     return [output, output]
 
 
@@ -1066,7 +1092,10 @@ def _convert_gru(
     recurrent_weight = etab.new_const(weightList[1].transpose([1, 0]))
     if keras_layer.use_bias:
         in_bias = etab.new_const(weightList[2])
+    if keras_layer.go_backwards:
+        in_data = _op.reverse(in_data, axis=1)
     units = list(weightList[0].shape)[1]
+    assert units > 0, "The value of units must be a positive integer"
     in_data = _op.nn.batch_flatten(in_data)
     matrix_x = _op.nn.dense(in_data, kernel_weight, units=units)
     if keras_layer.use_bias:
@@ -1397,9 +1426,9 @@ def from_keras(model, shape=None, layout="NCHW"):
         Input shapes of the model, optional
 
     layout: str
-        One of 'NCHW' or 'NHWC', indicates how data should be arranged in
-        the output model. Default layout is 'NCHW' as it in general
-        performs better across TVM.
+        One of 'NWC', 'NCHW', 'NHWC', 'NDHWC' indicates how data should
+        be arranged in the output model. Default layout is 'NCHW' as it
+        in general performs better across TVM.
 
     Returns
     -------
@@ -1416,6 +1445,12 @@ def from_keras(model, shape=None, layout="NCHW"):
     def _convert_input_layer(keras_layer):
         input_name = keras_layer.name
         input_shape = shape[input_name] if shape is not None and input_name in shape else None
+        if input_shape and len(input_shape) > 1 and any(dim <= 0 for dim in input_shape[1:]):
+            msg = (
+                "Expected input's non-batch dimensions to have positive length, "
+                f"but the input has a shape of {input_shape}"
+            )
+            raise ValueError(msg)
         etab.set_expr(input_name, new_var(input_name, shape=input_shape))
 
     def _convert_layer(keras_layer, etab, scope=""):
@@ -1513,12 +1548,19 @@ def from_keras(model, shape=None, layout="NCHW"):
             raise ValueError("Keras frontend currently supports tensorflow backend only.")
         if keras.backend.image_data_format() != "channels_last":
             raise ValueError("Keras frontend currently supports data_format = channels_last only.")
-        expected_model_class = keras.engine.training.Model
-        if hasattr(keras.engine, "InputLayer"):
-            input_layer_class = keras.engine.InputLayer
+        try:
+            import keras.engine as E
+        except ImportError:
+            try:
+                import keras.src.engine as E
+            except ImportError:
+                raise ImportError("Cannot find Keras's engine")
+        expected_model_class = E.training.Model
+        if hasattr(E, "InputLayer"):
+            input_layer_class = E.InputLayer
         else:
             # TFlite >=2.6
-            input_layer_class = keras.engine.input_layer.InputLayer
+            input_layer_class = E.input_layer.InputLayer
     else:
         # Importing from Tensorflow Keras (tf.keras)
         try:

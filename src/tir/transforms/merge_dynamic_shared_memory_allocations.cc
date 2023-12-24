@@ -299,6 +299,14 @@ class DynamicSharedMemoryRewriter : public StmtExprMutator {
     return StmtExprMutator::VisitStmt_(op);
   }
 
+  Stmt VisitStmt_(const DeclBufferNode* op) final {
+    auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
+    if (auto new_buf = GetUpdatedBuffer(node->buffer); !new_buf.same_as(node->buffer)) {
+      node.CopyOnWrite()->buffer = new_buf;
+    }
+    return std::move(node);
+  }
+
   PrimExpr VisitExpr_(const BufferLoadNode* op) final {
     auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
     return VisitBufferAccess(std::move(node));
@@ -336,6 +344,7 @@ class DynamicSharedMemoryRewriter : public StmtExprMutator {
 
     if (IsDynamicSharedMemory(buffer->data)) {
       ICHECK_EQ(buffer->shape.size(), 1)
+          << "Buffer " << buffer << " has shape " << buffer->shape << ".  "
           << "MergeDynamicSharedMemoryAllocations expects flat memory buffers, "
           << "and is to be run after "
           << "StorageFlatten (TE schedules) or FlattenBuffer (TIR schedules)";
@@ -438,9 +447,13 @@ class DynamicSharedMemoryRewriter : public StmtExprMutator {
       // - leaf stmt(offset = 0)
       // - end of scope(offset < 0)
       // In both cases, we need to handle the kill event correctly
+      auto is_leaf_alloc = [&](const VarNode* var) {
+        return seq[i].scope_pair_offset == 0 &&
+               std::find(it->second.gen.begin(), it->second.gen.end(), var) != it->second.gen.end();
+      };
       if (it != event_map_.end() && seq[i].scope_pair_offset <= 0) {
         for (const VarNode* var : it->second.kill) {
-          this->Free(var);
+          if (!is_leaf_alloc(var)) this->Free(var);
         }
       }
       // scope_pair_offset >= 0 means it is either
@@ -453,6 +466,11 @@ class DynamicSharedMemoryRewriter : public StmtExprMutator {
           const AllocateNode* alloc = dyn_shmem_allocs_[var];
           StorageEntry* dst_entry = FindAlloc(alloc);
           alloc_map_[var] = dst_entry;
+        }
+      }
+      if (it != event_map_.end() && seq[i].scope_pair_offset <= 0) {
+        for (const VarNode* var : it->second.kill) {
+          if (is_leaf_alloc(var)) this->Free(var);
         }
       }
     }
@@ -501,6 +519,7 @@ class DynamicSharedMemoryRewriter : public StmtExprMutator {
         StorageEntry* e = it->second;
         e->const_nbits = std::max(const_nbits, e->const_nbits);
         const_free_map_.erase(it);
+        it->second->allocs.push_back({op->buffer_var.get()});
         return e;
       }
       // Then start looking at smaller buffers.

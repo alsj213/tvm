@@ -41,6 +41,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Host.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
@@ -180,57 +181,62 @@ PackedFunc LLVMModuleNode::GetFunction(const String& name, const ObjectPtr<Objec
   return WrapPackedFunc(faddr, sptr_to_self);
 }
 
+namespace {
+#if TVM_LLVM_VERSION <= 70
+constexpr auto llvm_open_output_flag = llvm::sys::fs::F_None;
+#else
+constexpr auto llvm_open_output_flag = llvm::sys::fs::OF_None;
+#endif
+
+#if TVM_LLVM_VERSION <= 60
+std::unique_ptr<llvm::Module> CloneLLVMModule(llvm::Module* mod) { return llvm::CloneModule(mod); }
+#else
+std::unique_ptr<llvm::Module> CloneLLVMModule(llvm::Module* mod) { return llvm::CloneModule(*mod); }
+#endif
+
+#if TVM_LLVM_VERSION <= 90
+constexpr auto llvm_object_file_target = llvm::TargetMachine::CGFT_ObjectFile;
+constexpr auto llvm_assembly_file_target = llvm::TargetMachine::CGFT_AssemblyFile;
+#elif TVM_LLVM_VERSION <= 170
+constexpr auto llvm_object_file_target = llvm::CGFT_ObjectFile;
+constexpr auto llvm_assembly_file_target = llvm::CGFT_AssemblyFile;
+#else
+constexpr auto llvm_object_file_target = llvm::CodeGenFileType::ObjectFile;
+constexpr auto llvm_assembly_file_target = llvm::CodeGenFileType::AssemblyFile;
+#endif
+
+bool LLVMAddPassesToEmitFile(llvm::TargetMachine* tm, llvm::legacy::PassManager* pm,
+                             llvm::raw_fd_ostream* dest,
+                             decltype(llvm_object_file_target) llvm_file_target) {
+#if TVM_LLVM_VERSION <= 60
+  return tm->addPassesToEmitFile(*pm, *dest, llvm_file_target);
+#else
+  return tm->addPassesToEmitFile(*pm, *dest, nullptr, llvm_file_target);
+#endif
+}
+
+}  // namespace
+
 void LLVMModuleNode::SaveToFile(const String& file_name_str, const String& format) {
+  // CHECK(imports_.empty()) << "SaveToFile does not handle imported modules";
   std::string file_name = file_name_str;
   std::string fmt = runtime::GetFileFormat(file_name, format);
   std::error_code ecode;
-#if TVM_LLVM_VERSION <= 70
-  llvm::raw_fd_ostream dest(file_name, ecode, llvm::sys::fs::F_None);
-#else
-  llvm::raw_fd_ostream dest(file_name, ecode, llvm::sys::fs::OF_None);
-#endif
+  llvm::raw_fd_ostream dest(file_name, ecode, llvm_open_output_flag);
   ICHECK_EQ(ecode.value(), 0) << "Cannot open file: " << file_name << " " << ecode.message();
-  if (fmt == "o" || fmt == "obj") {
+  bool is_obj_file = fmt == "o" || fmt == "obj";
+  bool is_asm_file = fmt == "s" || fmt == "asm";
+  if (is_obj_file || is_asm_file) {
+    auto llvm_file_target = is_obj_file ? llvm_object_file_target : llvm_assembly_file_target;
+
     With<LLVMTarget> llvm_target(*llvm_instance_, LLVMTarget::GetTargetMetadata(*module_));
-#if TVM_LLVM_VERSION <= 60
-    std::unique_ptr<llvm::Module> m = llvm::CloneModule(module_);
-#else
-    std::unique_ptr<llvm::Module> m = llvm::CloneModule(*module_);
-#endif
     llvm::legacy::PassManager pass;
     llvm::TargetMachine* tm = llvm_target->GetOrCreateTargetMachine();
-#if TVM_LLVM_VERSION <= 60
-    ICHECK(tm->addPassesToEmitFile(pass, dest, llvm::TargetMachine::CGFT_ObjectFile) == 0)
-        << "Cannot emit target CGFT_ObjectFile";
-#elif TVM_LLVM_VERSION <= 90
-    ICHECK(tm->addPassesToEmitFile(pass, dest, nullptr, llvm::TargetMachine::CGFT_ObjectFile) == 0)
-        << "Cannot emit target CGFT_ObjectFile";
-#else
-    ICHECK(tm->addPassesToEmitFile(pass, dest, nullptr, llvm::CGFT_ObjectFile) == 0)
-        << "Cannot emit target CGFT_ObjectFile";
-#endif
-    pass.run(*m);
-  } else if (fmt == "s" || fmt == "asm") {
-    With<LLVMTarget> llvm_target(*llvm_instance_, LLVMTarget::GetTargetMetadata(*module_));
-#if TVM_LLVM_VERSION <= 60
-    std::unique_ptr<llvm::Module> m = llvm::CloneModule(module_);
-#else
-    std::unique_ptr<llvm::Module> m = llvm::CloneModule(*module_);
-#endif
-    llvm::legacy::PassManager pass;
-    llvm::TargetMachine* tm = llvm_target->GetOrCreateTargetMachine();
-#if TVM_LLVM_VERSION <= 60
-    ICHECK(tm->addPassesToEmitFile(pass, dest, llvm::TargetMachine::CGFT_AssemblyFile) == 0)
-        << "Cannot emit target CGFT_AssemblyFile";
-#elif TVM_LLVM_VERSION <= 90
-    ICHECK(tm->addPassesToEmitFile(pass, dest, nullptr, llvm::TargetMachine::CGFT_AssemblyFile) ==
-           0)
-        << "Cannot emit target CGFT_AssemblyFile";
-#else
-    ICHECK(tm->addPassesToEmitFile(pass, dest, nullptr, llvm::CGFT_AssemblyFile) == 0)
-        << "Cannot emit target CGFT_AssemblyFile";
-#endif
-    pass.run(*m);
+
+    auto err = LLVMAddPassesToEmitFile(tm, &pass, &dest, llvm_file_target);
+    ICHECK(!err) << "Cannot emit target CGFT_ObjectFile";
+
+    pass.run(*CloneLLVMModule(module_));
   } else if (fmt == "ll") {
     module_->print(dest, nullptr);
   } else if (fmt == "bc") {
@@ -271,9 +277,12 @@ String LLVMModuleNode::GetSource(const String& format) {
 #elif TVM_LLVM_VERSION <= 90
     ICHECK(tm->addPassesToEmitFile(pass, rso, nullptr, llvm::TargetMachine::CGFT_AssemblyFile) == 0)
         << "Cannot emit target CGFT_AssemblyFile";
-#else
+#elif TVM_LLVM_VERSION <= 170
     ICHECK(tm->addPassesToEmitFile(pass, rso, nullptr, llvm::CGFT_AssemblyFile) == 0)
         << "Cannot emit target CGFT_AssemblyFile";
+#else
+    ICHECK(tm->addPassesToEmitFile(pass, rso, nullptr, llvm::CodeGenFileType::AssemblyFile) == 0)
+        << "Cannot emit target CodeGenFileType::AssemblyFile";
 #endif
     pass.run(*m);
     return rso.str().str();
@@ -380,7 +389,11 @@ void LLVMModuleNode::LazyInitJIT() {
   With<LLVMTarget> llvm_target(*llvm_instance_, LLVMTarget::GetTargetMetadata(*module_));
   llvm::EngineBuilder builder(std::move(module_owning_ptr_));
   builder.setEngineKind(llvm::EngineKind::JIT);
+#if TVM_LLVM_VERSION <= 170
   builder.setOptLevel(llvm::CodeGenOpt::Aggressive);
+#else
+  builder.setOptLevel(llvm::CodeGenOptLevel::Aggressive);
+#endif
   builder.setMCPU(llvm_target->GetCPU());
   builder.setMAttrs(llvm_target->GetTargetFeatures());
   builder.setTargetOptions(llvm_target->GetTargetOptions());
@@ -482,6 +495,95 @@ TVM_REGISTER_GLOBAL("target.llvm_get_intrinsic_name").set_body_typed([](int64_t 
   return std::to_string(id);
 #endif
 });
+
+TVM_REGISTER_GLOBAL("target.llvm_get_system_x86_vendor").set_body_typed([]() -> String {
+#if TVM_LLVM_VERSION >= 120
+#if defined(__i386__) || defined(_M_IX86) || defined(__x86_64__) || defined(_M_X64)
+  using namespace llvm::sys::detail::x86;
+  const auto x86_sign = getVendorSignature();
+  if (x86_sign == VendorSignatures::GENUINE_INTEL)
+    return "intel";
+  else if (x86_sign == VendorSignatures::AUTHENTIC_AMD)
+    return "amd";
+  else if (x86_sign == VendorSignatures::UNKNOWN)
+    return "unknown";
+#endif
+#endif
+  return "unimplemented";
+});
+
+TVM_REGISTER_GLOBAL("target.llvm_get_system_triple").set_body_typed([]() -> String {
+  return llvm::sys::getDefaultTargetTriple();
+});
+
+TVM_REGISTER_GLOBAL("target.llvm_get_system_cpu").set_body_typed([]() -> String {
+  return llvm::sys::getHostCPUName().str();
+});
+
+TVM_REGISTER_GLOBAL("target.llvm_get_targets").set_body_typed([]() -> Array<String> {
+  auto llvm_instance = std::make_unique<LLVMInstance>();
+  LLVMTargetInfo llvm_backend(*llvm_instance, "llvm");
+  return llvm_backend.GetAllLLVMTargets();
+});
+
+TVM_REGISTER_GLOBAL("target.llvm_get_cpu_archlist")
+    .set_body_typed([](const Target& target) -> Array<String> {
+      auto use_target = target.defined() ? target : Target::Current(false);
+      // ignore non "llvm" target
+      if (target.defined()) {
+        if (target->kind->name != "llvm") {
+          return Array<String>{};
+        }
+      }
+      auto llvm_instance = std::make_unique<LLVMInstance>();
+      LLVMTargetInfo llvm_backend(*llvm_instance, use_target);
+      return llvm_backend.GetAllLLVMTargetArches();
+    });
+
+TVM_REGISTER_GLOBAL("target.llvm_get_cpu_features")
+    .set_body_typed([](const Target& target) -> Array<String> {
+      auto use_target = target.defined() ? target : Target::Current(false);
+      // ignore non "llvm" target
+      if (target.defined()) {
+        if (target->kind->name != "llvm") {
+          return Array<String>{};
+        }
+      }
+      auto llvm_instance = std::make_unique<LLVMInstance>();
+      LLVMTargetInfo llvm_backend(*llvm_instance, use_target);
+      return llvm_backend.GetAllLLVMCpuFeatures();
+    });
+
+TVM_REGISTER_GLOBAL("target.llvm_cpu_has_feature")
+    .set_body_typed([](const String feature, const Target& target) -> bool {
+      auto use_target = target.defined() ? target : Target::Current(false);
+      // ignore non "llvm" target
+      if (target.defined()) {
+        if (target->kind->name != "llvm") {
+          return false;
+        }
+      }
+      auto llvm_instance = std::make_unique<LLVMInstance>();
+      LLVMTargetInfo llvm_backend(*llvm_instance, use_target);
+      auto cpu_features = llvm_backend.GetAllLLVMCpuFeatures();
+      bool has_feature = std::any_of(cpu_features.begin(), cpu_features.end(),
+                                     [&](auto& var) { return var == feature; });
+      return has_feature;
+    });
+
+TVM_REGISTER_GLOBAL("target.target_has_feature")
+    .set_body_typed([](const String feature, const Target& target) -> bool {
+      auto use_target = target.defined() ? target : Target::Current(false);
+      // ignore non "llvm" target
+      if (target.defined()) {
+        if (target->kind->name != "llvm") {
+          return false;
+        }
+      }
+      auto llvm_instance = std::make_unique<LLVMInstance>();
+      LLVMTargetInfo llvm_target(*llvm_instance, use_target);
+      return llvm_target.TargetHasCPUFeature(feature);
+    });
 
 TVM_REGISTER_GLOBAL("target.llvm_version_major").set_body_typed([]() -> int {
   return TVM_LLVM_VERSION / 10;
